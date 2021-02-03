@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { useQuery } from "@apollo/client";
 import useStores from "hooks/useStores";
+import { useAnalytics } from "use-analytics";
 import viewerQuery from "./viewer.gql";
 
 /**
@@ -10,7 +11,15 @@ import viewerQuery from "./viewer.gql";
  */
 export default function useViewer() {
   const { authStore } = useStores();
-  const { account, setAccount, accessToken } = authStore;
+  const { identify } = useAnalytics();
+
+  const {
+    account,
+    setAccount,
+    accessToken,
+    identified,
+    setIdentified
+  } = authStore;
 
   const { loading, data, refetch } = useQuery(viewerQuery, {
     skip: !accessToken
@@ -25,7 +34,22 @@ export default function useViewer() {
   }, [accessToken, viewer]);
 
   useEffect(() => {
-    if (viewer) setAccount(viewer);
+    if (viewer) {
+      setAccount(viewer);
+      // identify the user
+      const isAuthenticated = viewer?._id;
+
+      if (isAuthenticated) {
+        !identified && identify(isAuthenticated, {
+          firstName: viewer?.firstName,
+          lastName: viewer?.lastName,
+          email: viewer.primaryEmailAddress
+        });
+        setIdentified(true);
+      } else {
+        setIdentified(false);
+      }
+    }
   }, [viewer]);
 
   return [

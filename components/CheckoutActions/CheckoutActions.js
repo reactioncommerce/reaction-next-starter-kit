@@ -1,5 +1,5 @@
 /* eslint-disable react/no-multi-comp */
-import React, { Fragment, Component } from "react";
+import React, { Fragment, useState, useEffect } from "react";
 import PropTypes from "prop-types";
 import { isEqual } from "lodash";
 import styled from "styled-components";
@@ -9,11 +9,11 @@ import FulfillmentOptionsCheckoutAction from "@reactioncommerce/components/Fulfi
 import PaymentsCheckoutAction from "@reactioncommerce/components/PaymentsCheckoutAction/v1";
 import FinalReviewCheckoutAction from "@reactioncommerce/components/FinalReviewCheckoutAction/v1";
 import { addTypographyStyles } from "@reactioncommerce/components/utils";
-import withAddressValidation from "containers/address/withAddressValidation";
 import Dialog from "@material-ui/core/Dialog";
 import PageLoading from "components/PageLoading";
 import Router from "translations/i18nRouter";
 import calculateRemainderDue from "lib/utils/calculateRemainderDue";
+import useTrackerEvents from "hooks/analytics/useTrackerEvents";
 import { placeOrderMutation } from "../../hooks/orders/placeOrder.gql";
 
 const MessageDiv = styled.div`
@@ -24,168 +24,193 @@ const NoPaymentMethodsMessage = () => <MessageDiv>No payment methods available</
 
 NoPaymentMethodsMessage.renderComplete = () => "";
 
-class CheckoutActions extends Component {
-  static propTypes = {
-    addressValidation: PropTypes.func.isRequired,
-    addressValidationResults: PropTypes.object,
-    apolloClient: PropTypes.shape({
-      mutate: PropTypes.func.isRequired
-    }),
-    cart: PropTypes.shape({
-      account: PropTypes.object,
-      checkout: PropTypes.object,
-      email: PropTypes.string,
-      items: PropTypes.array
-    }).isRequired,
-    cartStore: PropTypes.object,
-    checkoutMutations: PropTypes.shape({
-      onSetFulfillmentOption: PropTypes.func.isRequired,
-      onSetShippingAddress: PropTypes.func.isRequired
-    }),
-    clearAuthenticatedUsersCart: PropTypes.func.isRequired,
-    orderEmailAddress: PropTypes.string.isRequired,
-    paymentMethods: PropTypes.array
+const CheckoutActions = (props) => {
+  const {
+    checkoutMutations: { onSetShippingAddress, onSetFulfillmentOption },
+    cart,
+    cartStore,
+    orderEmailAddress,
+    clearAuthenticatedUsersCart,
+    paymentMethods,
+    addressValidation,
+    addressValidationResults
+  } = props;
+
+  const {
+    trackCheckoutStartedEvent,
+    trackCheckoutStepViewed,
+    trackCheckoutStepCompleted,
+    trackOrderCompleted,
+    trackPaymentInfoEntered
+  } = useTrackerEvents();
+
+  const { checkout: { fulfillmentGroups, summary }, items } = cart;
+
+  const [selectedPaymentMethod, setSelectedPaymentMethod] = useState(null);
+  const [selectedShippingMethod, setSelectedShippingMethod] = useState(null);
+  const [hasPaymentError, setHasPaymentError] = useState(false);
+  const [prevAddressValidationResults, setPrevAddressValidationResults] = useState({});
+  const [isPlacingOrder, setIsPlacingOrder] = useState(false);
+  const [actionAlerts, setActionAlerts] = useState({
+    1: null,
+    2: null,
+    3: null,
+    4: null
+  });
+
+  const handleActionAlerts = (action) => {
+    setActionAlerts({ ...actionAlerts, ...action });
   };
 
-  state = {
-    actionAlerts: {
-      1: null,
-      2: null,
-      3: null,
-      4: null
-    },
-    hasPaymentError: false,
-    isPlacingOrder: false
+  const shippingMethodData = () => {
+    const { selectedFulfillmentOption } = fulfillmentGroups[0];
+    return selectedFulfillmentOption ? selectedFulfillmentOption.fulfillmentMethod.displayName : null;
   };
 
-  componentDidUpdate({ addressValidationResults: prevAddressValidationResults }) {
-    const { addressValidationResults } = this.props;
+  const paymentMethodData = () => {
+    const [firstPayment] = cartStore.checkoutPayments;
+    return firstPayment ? firstPayment.payment.method : null;
+  };
+
+  const handleValidationErrors = () => {
+    const { validationErrors } = addressValidationResults || [];
+    const shippingAlert = validationErrors && validationErrors.length ? {
+      alertType: validationErrors[0].type,
+      title: validationErrors[0].summary,
+      message: validationErrors[0].details
+    } : null;
+
+    handleActionAlerts({ 1: shippingAlert });
+  };
+
+  useEffect(() => {
+    setSelectedPaymentMethod(paymentMethodData());
+    setSelectedShippingMethod(shippingMethodData());
+  }, [cart.checkout, cartStore.checkoutPayments]);
+
+  useEffect(() => {
+    // track the checkout started
+    trackCheckoutStartedEvent({ cart });
+
+    const [fulfillmentGroup] = fulfillmentGroups;
+
     if (
       addressValidationResults &&
       prevAddressValidationResults &&
       !isEqual(addressValidationResults, prevAddressValidationResults)
     ) {
-      this.handleValidationErrors();
+      handleValidationErrors();
     }
-  }
 
-  componentDidMount() {
-    this._isMounted = true;
-  }
+    // Track the first step, "Enter a shipping address" when the page renders,
+    // as it will be expanded by default, only record this event when the
+    // shipping address has not yet been set.
+    if (!fulfillmentGroup.shippingAddress) {
+      trackCheckoutStepViewed({
+        step: 1,
+        // TODO: not sure if checkout_id can be the same cart id
+        checkout_id: cart._id, // eslint-disable-line camelcase
+        payment_method: selectedPaymentMethod, // eslint-disable-line camelcase
+        shipping_method: selectedShippingMethod // eslint-disable-line camelcase
+      });
+    }
 
-  componentWillUnmount() {
-    this._isMounted = false;
-  }
+    return setPrevAddressValidationResults(addressValidationResults);
+  }, []);
 
-  buildData = ({ step, action }) => ({
-    action,
-    payment_method: this.paymentMethod, // eslint-disable-line camelcase
-    shipping_method: this.shippingMethod, // eslint-disable-line camelcase
-    step
-  });
-
-  get shippingMethod() {
-    const { checkout: { fulfillmentGroups } } = this.props.cart;
-    const { selectedFulfillmentOption } = fulfillmentGroups[0];
-    return selectedFulfillmentOption ? selectedFulfillmentOption.fulfillmentMethod.displayName : null;
-  }
-
-  get paymentMethod() {
-    const [firstPayment] = this.props.cartStore.checkoutPayments;
-    return firstPayment ? firstPayment.payment.method : null;
-  }
-
-  setShippingAddress = async (address) => {
-    const { checkoutMutations: { onSetShippingAddress } } = this.props;
+  const setShippingAddress = async (address) => {
     delete address.isValid;
     const { data, error } = await onSetShippingAddress(address);
 
-    if (data && !error && this._isMounted) {
-      this.setState({
-        actionAlerts: {
-          1: {}
-        }
+    if (data && !error) {
+      handleActionAlerts({ 1: {} });
+
+      // track successfully setting a shipping address
+      trackCheckoutStepCompleted({
+        step: 1,
+        checkout_id: cart._id, // eslint-disable-line camelcase
+        payment_method: selectedPaymentMethod, // eslint-disable-line camelcase
+        shipping_method: selectedShippingMethod // eslint-disable-line camelcase
+      });
+
+      // The next step will automatically be expanded, so lets track that
+      trackCheckoutStepViewed({
+        step: 2,
+        checkout_id: cart._id, // eslint-disable-line camelcase
+        payment_method: selectedPaymentMethod, // eslint-disable-line camelcase
+        shipping_method: selectedShippingMethod // eslint-disable-line camelcase
       });
     }
   };
 
-  handleValidationErrors() {
-    const { addressValidationResults } = this.props;
-    const { validationErrors } = addressValidationResults || [];
-    const shippingAlert =
-      validationErrors && validationErrors.length ? {
-        alertType: validationErrors[0].type,
-        title: validationErrors[0].summary,
-        message: validationErrors[0].details
-      } : null;
-    this.setState({ actionAlerts: { 1: shippingAlert } });
-  }
-
-  setShippingMethod = async (shippingMethod) => {
-    const { checkoutMutations: { onSetFulfillmentOption } } = this.props;
-    const { checkout: { fulfillmentGroups } } = this.props.cart;
+  const setShippingMethod = async (shippingMethod) => {
     const fulfillmentOption = {
       fulfillmentGroupId: fulfillmentGroups[0]._id,
       fulfillmentMethodId: shippingMethod.selectedFulfillmentOption.fulfillmentMethod._id
     };
 
-    await onSetFulfillmentOption(fulfillmentOption);
+    const { data, error } = await onSetFulfillmentOption(fulfillmentOption);
+    if (data && !error) {
+      const {
+        selectFulfillmentOptionForGroup: {
+          cart: {
+            checkout: {
+              fulfillmentGroups: fulfillmentGroupsSelected
+            }
+          }
+        }
+      } = data;
+      const selectedShipping = fulfillmentGroupsSelected[0]?.selectedFulfillmentOption?.fulfillmentMethod?.displayName;
+
+      setSelectedShippingMethod(selectedShipping);
+      // track successfully setting a shipping method
+      trackCheckoutStepCompleted({
+        step: 2,
+        checkout_id: cart._id, // eslint-disable-line camelcase
+        payment_method: selectedPaymentMethod, // eslint-disable-line camelcase
+        shipping_method: selectedShipping // eslint-disable-line camelcase
+      });
+
+      // The next step will automatically be expanded, so lets track that
+      trackCheckoutStepViewed({
+        step: 3,
+        checkout_id: cart._id, // eslint-disable-line camelcase
+        payment_method: selectedPaymentMethod, // eslint-disable-line camelcase
+        shipping_method: selectedShipping // eslint-disable-line camelcase
+      });
+    }
   };
 
-  handlePaymentSubmit = (paymentInput) => {
-    this.props.cartStore.addCheckoutPayment(paymentInput);
+  const handlePaymentSubmit = (paymentInput) => {
+    const selectedPayment = paymentInput?.payment?.method;
+    setSelectedPaymentMethod(selectedPayment);
 
-    this.setState({
-      hasPaymentError: false,
-      actionAlerts: {
-        3: {}
-      }
+    cartStore.addCheckoutPayment(paymentInput);
+    setHasPaymentError(false);
+    handleActionAlerts({ 3: {} });
+
+    trackPaymentInfoEntered({
+      step: 3,
+      checkout_id: cart._id, // eslint-disable-line camelcase
+      payment_method: selectedPayment, // eslint-disable-line camelcase
+      shipping_method: selectedShippingMethod // eslint-disable-line camelcase
+    });
+
+    // The next step will automatically be expanded, so lets track that
+    trackCheckoutStepViewed({
+      step: 4,
+      checkout_id: cart._id, // eslint-disable-line camelcase
+      payment_method: selectedPayment, // eslint-disable-line camelcase
+      shipping_method: selectedShippingMethod // eslint-disable-line camelcase
     });
   };
 
-  handlePaymentsReset = () => {
-    this.props.cartStore.resetCheckoutPayments();
-  }
-
-  buildOrder = async () => {
-    const { cart, cartStore, orderEmailAddress } = this.props;
-    const cartId = cartStore.hasAccountCart ? cartStore.accountCartId : cartStore.anonymousCartId;
-    const { checkout } = cart;
-
-    const fulfillmentGroups = checkout.fulfillmentGroups.map((group) => {
-      const { data } = group;
-      const { selectedFulfillmentOption } = group;
-
-      const items = cart.items.map((item) => ({
-        addedAt: item.addedAt,
-        price: item.price.amount,
-        productConfiguration: item.productConfiguration,
-        quantity: item.quantity
-      }));
-
-      return {
-        data,
-        items,
-        selectedFulfillmentMethodId: selectedFulfillmentOption.fulfillmentMethod._id,
-        shopId: group.shop._id,
-        totalPrice: checkout.summary.total.amount,
-        type: group.type
-      };
-    });
-
-    const order = {
-      cartId,
-      currencyCode: checkout.summary.total.currency.code,
-      email: orderEmailAddress,
-      fulfillmentGroups,
-      shopId: cart.shop._id
-    };
-
-    return this.setState({ isPlacingOrder: true }, () => this.placeOrder(order));
+  const handlePaymentsReset = () => {
+    cartStore.resetCheckoutPayments();
   };
 
-  placeOrder = async (order) => {
-    const { cartStore, clearAuthenticatedUsersCart, apolloClient } = this.props;
+  const placeOrder = async (order) => {
+    const { apolloClient } = props;
 
     // Payments can have `null` amount to mean "remaining".
     let remainingAmountDue = order.fulfillmentGroups.reduce((sum, group) => sum + group.totalPrice, 0);
@@ -217,141 +242,190 @@ class CheckoutActions extends Component {
 
       const { placeOrder: { orders, token } } = data;
 
+      trackCheckoutStepCompleted({
+        step: 4,
+        checkout_id: cart._id, // eslint-disable-line camelcase
+        payment_method: selectedPaymentMethod, // eslint-disable-line camelcase
+        shipping_method: selectedShippingMethod // eslint-disable-line camelcase
+      });
+
+      trackOrderCompleted({ orders });
+
       // Send user to order confirmation page
-      Router.push(`/checkout/order?orderId=${orders[0].referenceId}${token ? `&token=${token}` : ""}`);
+      Router.push(`/checkout/order?orderId=${orders[0]?.referenceId}${token ? `&token=${token}` : ""}`);
     } catch (error) {
-      if (this._isMounted) {
-        this.setState({
-          hasPaymentError: true,
-          isPlacingOrder: false,
-          actionAlerts: {
-            3: {
-              alertType: "error",
-              title: "Payment method failed",
-              message: error.toString().replace("Error: GraphQL error:", "")
-            }
-          }
-        });
-      }
+      setHasPaymentError(true);
+      setIsPlacingOrder(false);
+      handleActionAlerts({
+        3: {
+          alertType: "error",
+          title: "Payment method failed",
+          message: error.toString().replace("Error: GraphQL error:", "")
+        }
+      });
     }
   };
 
-  renderPlacingOrderOverlay = () => {
-    const { isPlacingOrder } = this.state;
+  const buildOrder = async () => {
+    const cartId = cartStore.hasAccountCart ? cartStore.accountCartId : cartStore.anonymousCartId;
+    const { checkout } = cart;
 
-    return (
-      <Dialog fullScreen disableBackdropClick={true} disableEscapeKeyDown={true} open={isPlacingOrder}>
-        <PageLoading delay={0} message="Placing your order..." />
-      </Dialog>
-    );
-  };
+    const fulfillmentGroupsData = checkout.fulfillmentGroups.map((group) => {
+      const { data } = group;
+      const { selectedFulfillmentOption } = group;
 
-  render() {
-    const {
-      addressValidation,
-      addressValidationResults,
-      cart,
-      cartStore,
-      paymentMethods
-    } = this.props;
+      const itemsData = cart.items.map((item) => ({
+        addedAt: item.addedAt,
+        price: item.price.amount,
+        productConfiguration: item.productConfiguration,
+        quantity: item.quantity
+      }));
 
-    const { checkout: { fulfillmentGroups, summary }, items } = cart;
-    const { actionAlerts, hasPaymentError } = this.state;
-    const [fulfillmentGroup] = fulfillmentGroups;
+      return {
+        data,
+        items: itemsData,
+        selectedFulfillmentMethodId: selectedFulfillmentOption.fulfillmentMethod._id,
+        shopId: group.shop._id,
+        totalPrice: checkout.summary.total.amount,
+        type: group.type
+      };
+    });
 
-    // Order summary
-    const { fulfillmentTotal, itemTotal, surchargeTotal, taxTotal, total } = summary;
-    const checkoutSummary = {
-      displayShipping: fulfillmentTotal && fulfillmentTotal.displayAmount,
-      displaySubtotal: itemTotal.displayAmount,
-      displaySurcharge: surchargeTotal.displayAmount,
-      displayTotal: total.displayAmount,
-      displayTax: taxTotal && taxTotal.displayAmount,
-      items
+    const order = {
+      cartId,
+      currencyCode: checkout.summary.total.currency.code,
+      email: orderEmailAddress,
+      fulfillmentGroups: fulfillmentGroupsData,
+      shopId: cart.shop._id
     };
 
-    const addresses = fulfillmentGroups.reduce((list, group) => {
-      if (group.shippingAddress) list.push(group.shippingAddress);
-      return list;
-    }, []);
+    setIsPlacingOrder(true);
+    placeOrder(order);
+  };
 
-    const payments = cartStore.checkoutPayments.slice();
-    const remainingAmountDue = calculateRemainderDue(payments, total.amount);
+  const renderPlacingOrderOverlay = () => (
+    <Dialog fullScreen disableBackdropClick={true} disableEscapeKeyDown={true} open={isPlacingOrder}>
+      <PageLoading delay={0} message="Placing your order..." />
+    </Dialog>
+  );
 
-    let PaymentComponent = PaymentsCheckoutAction;
-    if (!Array.isArray(paymentMethods) || paymentMethods.length === 0) {
-      PaymentComponent = NoPaymentMethodsMessage;
-    }
+  const [fulfillmentGroup] = fulfillmentGroups;
 
-    const actions = [
-      {
-        id: "1",
-        activeLabel: "Enter a shipping address",
-        completeLabel: "Shipping address",
-        incompleteLabel: "Shipping address",
-        status: fulfillmentGroup.type !== "shipping" || fulfillmentGroup.shippingAddress ? "complete" : "incomplete",
-        component: ShippingAddressCheckoutAction,
-        onSubmit: this.setShippingAddress,
-        props: {
-          addressValidationResults,
-          alert: actionAlerts["1"],
-          fulfillmentGroup,
-          onAddressValidation: addressValidation
-        }
-      },
-      {
-        id: "2",
-        activeLabel: "Choose a shipping method",
-        completeLabel: "Shipping method",
-        incompleteLabel: "Shipping method",
-        status: fulfillmentGroup.selectedFulfillmentOption ? "complete" : "incomplete",
-        component: FulfillmentOptionsCheckoutAction,
-        onSubmit: this.setShippingMethod,
-        props: {
-          alert: actionAlerts["2"],
-          fulfillmentGroup
-        }
-      },
-      {
-        id: "3",
-        activeLabel: "Enter payment information",
-        completeLabel: "Payment information",
-        incompleteLabel: "Payment information",
-        status: remainingAmountDue === 0 && !hasPaymentError ? "complete" : "incomplete",
-        component: PaymentComponent,
-        onSubmit: this.handlePaymentSubmit,
-        props: {
-          addresses,
-          alert: actionAlerts["3"],
-          onReset: this.handlePaymentsReset,
-          payments,
-          paymentMethods,
-          remainingAmountDue
-        }
-      },
-      {
-        id: "4",
-        activeLabel: "Review and place order",
-        completeLabel: "Review and place order",
-        incompleteLabel: "Review and place order",
-        status: "incomplete",
-        component: FinalReviewCheckoutAction,
-        onSubmit: this.buildOrder,
-        props: {
-          alert: actionAlerts["4"],
-          checkoutSummary,
-          productURLPath: "/api/detectLanguage/product/"
-        }
-      }
-    ];
+  // Order summary
+  const { fulfillmentTotal, itemTotal, surchargeTotal, taxTotal, total } = summary;
+  const checkoutSummary = {
+    displayShipping: fulfillmentTotal && fulfillmentTotal.displayAmount,
+    displaySubtotal: itemTotal.displayAmount,
+    displaySurcharge: surchargeTotal.displayAmount,
+    displayTotal: total.displayAmount,
+    displayTax: taxTotal && taxTotal.displayAmount,
+    items
+  };
 
-    return (
-      <Fragment>
-        {this.renderPlacingOrderOverlay()}
-        <Actions actions={actions} />
-      </Fragment>
-    );
+  const addresses = fulfillmentGroups.reduce((list, group) => {
+    if (group.shippingAddress) list.push(group.shippingAddress);
+    return list;
+  }, []);
+
+  const payments = cartStore.checkoutPayments.slice();
+  const remainingAmountDue = calculateRemainderDue(payments, total.amount);
+
+  let PaymentComponent = PaymentsCheckoutAction;
+  if (!Array.isArray(paymentMethods) || paymentMethods.length === 0) {
+    PaymentComponent = NoPaymentMethodsMessage;
   }
-}
 
-export default withAddressValidation(CheckoutActions);
+  const actions = [
+    {
+      id: "1",
+      activeLabel: "Enter a shipping address",
+      completeLabel: "Shipping address",
+      incompleteLabel: "Shipping address",
+      status: fulfillmentGroup.type !== "shipping" || fulfillmentGroup.shippingAddress ? "complete" : "incomplete",
+      component: ShippingAddressCheckoutAction,
+      onSubmit: setShippingAddress,
+      props: {
+        addressValidationResults,
+        alert: actionAlerts["1"],
+        fulfillmentGroup,
+        onAddressValidation: addressValidation
+      }
+    },
+    {
+      id: "2",
+      activeLabel: "Choose a shipping method",
+      completeLabel: "Shipping method",
+      incompleteLabel: "Shipping method",
+      status: fulfillmentGroup.selectedFulfillmentOption ? "complete" : "incomplete",
+      component: FulfillmentOptionsCheckoutAction,
+      onSubmit: setShippingMethod,
+      props: {
+        alert: actionAlerts["2"],
+        fulfillmentGroup
+      }
+    },
+    {
+      id: "3",
+      activeLabel: "Enter payment information",
+      completeLabel: "Payment information",
+      incompleteLabel: "Payment information",
+      status: remainingAmountDue === 0 && !hasPaymentError ? "complete" : "incomplete",
+      component: PaymentComponent,
+      onSubmit: handlePaymentSubmit,
+      props: {
+        addresses,
+        alert: actionAlerts["3"],
+        onReset: handlePaymentsReset,
+        payments,
+        paymentMethods,
+        remainingAmountDue
+      }
+    },
+    {
+      id: "4",
+      activeLabel: "Review and place order",
+      completeLabel: "Review and place order",
+      incompleteLabel: "Review and place order",
+      status: "incomplete",
+      component: FinalReviewCheckoutAction,
+      onSubmit: buildOrder,
+      props: {
+        alert: actionAlerts["4"],
+        checkoutSummary,
+        productURLPath: "/api/detectLanguage/product/"
+      }
+    }
+  ];
+
+  return (
+    <Fragment>
+      {renderPlacingOrderOverlay()}
+      <Actions actions={actions} />
+    </Fragment>
+  );
+};
+
+
+CheckoutActions.propTypes = {
+  addressValidation: PropTypes.func.isRequired,
+  addressValidationResults: PropTypes.array.isRequired,
+  apolloClient: PropTypes.shape({
+    mutate: PropTypes.func.isRequired
+  }),
+  cart: PropTypes.shape({
+    account: PropTypes.object,
+    checkout: PropTypes.object,
+    email: PropTypes.string,
+    items: PropTypes.array
+  }).isRequired,
+  cartStore: PropTypes.object,
+  checkoutMutations: PropTypes.shape({
+    onSetFulfillmentOption: PropTypes.func.isRequired,
+    onSetShippingAddress: PropTypes.func.isRequired
+  }),
+  clearAuthenticatedUsersCart: PropTypes.func.isRequired,
+  orderEmailAddress: PropTypes.string.isRequired,
+  paymentMethods: PropTypes.array
+};
+
+export default CheckoutActions;
